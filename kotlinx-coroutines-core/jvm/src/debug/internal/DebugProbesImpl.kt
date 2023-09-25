@@ -9,20 +9,16 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.internal.ScopeCoroutine
 import java.io.*
 import java.lang.StackTraceElement
-import java.text.*
-import java.util.concurrent.locks.*
 import kotlin.collections.ArrayList
 import kotlin.concurrent.*
 import kotlin.coroutines.*
 import kotlin.coroutines.jvm.internal.CoroutineStackFrame
 import kotlin.synchronized
-import _COROUTINE.ArtificialStackFrames
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 @PublishedApi
 internal object DebugProbesImpl {
-    private val ARTIFICIAL_FRAME = ArtificialStackFrames().coroutineCreation()
-    private val dateFormat = SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
-
     private var weakRefCleanerThread: Thread? = null
 
     // Values are boolean, so this map does not need to use a weak reference queue
@@ -44,21 +40,8 @@ internal object DebugProbesImpl {
     private val sequenceNumber = atomic(0L)
 
     internal var sanitizeStackTraces: Boolean = true
-    internal var enableCreationStackTraces: Boolean = true
+    internal var enableCreationStackTraces: Boolean = false
     public var ignoreCoroutinesWithEmptyContext: Boolean = true
-
-    /*
-     * Substitute for service loader, DI between core and debug modules.
-     * If the agent was installed via command line -javaagent parameter, do not use byte-buddy to avoid dynamic attach.
-     */
-    private val dynamicAttach = getDynamicAttach()
-
-    @Suppress("UNCHECKED_CAST")
-    private fun getDynamicAttach(): Function1<Boolean, Unit>? = runCatching {
-        val clz = Class.forName("kotlinx.coroutines.debug.internal.ByteBuddyDynamicAttach")
-        val ctor = clz.constructors[0]
-        ctor.newInstance() as Function1<Boolean, Unit>
-    }.getOrNull()
 
     /**
      * Because `probeCoroutinesResumed` is called for every resumed continuation (see KT-29997 and the related code),
@@ -77,8 +60,6 @@ internal object DebugProbesImpl {
     internal fun install() {
         if (installations.incrementAndGet() > 1) return
         startWeakRefCleanerThread()
-        if (AgentInstallationType.isInstalledStatically) return
-        dynamicAttach?.invoke(true) // attach
     }
 
     internal fun uninstall() {
@@ -88,7 +69,6 @@ internal object DebugProbesImpl {
         capturedCoroutinesMap.clear()
         callerInfoCache.clear()
         if (AgentInstallationType.isInstalledStatically) return
-        dynamicAttach?.invoke(false) // detach
     }
 
     private fun startWeakRefCleanerThread() {
@@ -280,7 +260,7 @@ internal object DebugProbesImpl {
 
     private fun dumpCoroutinesSynchronized(out: PrintStream) {
         check(isInstalled) { "Debug probes are not installed" }
-        out.print("Coroutines dump ${dateFormat.format(System.currentTimeMillis())}")
+        out.print("Coroutines dump ${DateTimeFormatter.ISO_LOCAL_DATE_TIME.format(LocalDateTime.now())}")
         capturedCoroutines
             .asSequence()
             .filter { !it.isFinished() }
@@ -294,10 +274,7 @@ internal object DebugProbesImpl {
                 else
                     info.state
                 out.print("\n\nCoroutine ${owner.delegate}, state: $state")
-                if (observedStackTrace.isEmpty()) {
-                    out.print("\n\tat $ARTIFICIAL_FRAME")
-                    printStackTrace(out, info.creationStackTrace)
-                } else {
+                if (!observedStackTrace.isEmpty()) {
                     printStackTrace(out, enhancedStackTrace)
                 }
             }
@@ -487,30 +464,16 @@ internal object DebugProbesImpl {
          */
         val owner = completion.owner()
         if (owner != null) return completion
-        /*
-         * Here we replace completion with a sequence of StackTraceFrame objects
-         * which represents creation stacktrace, thus making stacktrace recovery mechanism
-         * even more verbose (it will attach coroutine creation stacktrace to all exceptions),
-         * and then using CoroutineOwner completion as unique identifier of coroutineSuspended/resumed calls.
-         */
-        val frame = if (enableCreationStackTraces) {
-            sanitizeStackTrace(Exception()).toStackTraceFrame()
-        } else {
-            null
-        }
-        return createOwner(completion, frame)
+        return createOwner(completion = completion)
     }
 
-    private fun List<StackTraceElement>.toStackTraceFrame(): StackTraceFrame =
-        StackTraceFrame(
-            foldRight<StackTraceElement, StackTraceFrame?>(null) { frame, acc ->
-                StackTraceFrame(acc, frame)
-            }, ARTIFICIAL_FRAME
-        )
-
-    private fun <T> createOwner(completion: Continuation<T>, frame: StackTraceFrame?): Continuation<T> {
+    private fun <T> createOwner(completion: Continuation<T>): Continuation<T> {
         if (!isInstalled) return completion
-        val info = DebugCoroutineInfoImpl(completion.context, frame, sequenceNumber.incrementAndGet())
+        val info = DebugCoroutineInfoImpl(
+            context = completion.context,
+            creationStackBottom = null,
+            sequenceNumber = sequenceNumber.incrementAndGet()
+        )
         val owner = CoroutineOwner(completion, info)
         capturedCoroutinesMap[owner] = true
         if (!isInstalled) capturedCoroutinesMap.clear()
@@ -551,55 +514,6 @@ internal object DebugProbesImpl {
 
         override fun toString(): String = delegate.toString()
     }
-
-    private fun <T : Throwable> sanitizeStackTrace(throwable: T): List<StackTraceElement> {
-        val stackTrace = throwable.stackTrace
-        val size = stackTrace.size
-        val traceStart = 1 + stackTrace.indexOfLast { it.className == "kotlin.coroutines.jvm.internal.DebugProbesKt" }
-
-        if (!sanitizeStackTraces) {
-            return List(size - traceStart) { stackTrace[it + traceStart] }
-        }
-
-        /*
-         * Trim intervals of internal methods from the stacktrace (bounds are excluded from trimming)
-         * E.g. for sequence [e, i1, i2, i3, e, i4, e, i5, i6, i7]
-         * output will be [e, i1, i3, e, i4, e, i5, i7]
-         *
-         * If an interval of internal methods ends in a synthetic method, the outermost non-synthetic method in that
-         * interval will also be included.
-         */
-        val result = ArrayList<StackTraceElement>(size - traceStart + 1)
-        var i = traceStart
-        while (i < size) {
-            if (stackTrace[i].isInternalMethod) {
-                result += stackTrace[i] // we include the boundary of the span in any case
-                // first index past the end of the span of internal methods that starts from `i`
-                var j = i + 1
-                while (j < size && stackTrace[j].isInternalMethod) {
-                    ++j
-                }
-                // index of the last non-synthetic internal methods in this span, or `i` if there are no such methods
-                var k = j - 1
-                while (k > i && stackTrace[k].fileName == null) {
-                    k -= 1
-                }
-                if (k > i && k < j - 1) {
-                    /* there are synthetic internal methods at the end of this span, but there is a non-synthetic method
-                    after `i`, so we include it. */
-                    result += stackTrace[k]
-                }
-                result += stackTrace[j - 1] // we include the other boundary of this span in any case, too
-                i = j
-            } else {
-                result += stackTrace[i]
-                ++i
-            }
-        }
-        return result
-    }
-
-    private val StackTraceElement.isInternalMethod: Boolean get() = className.startsWith("kotlinx.coroutines")
 }
 
 private fun String.repr(): String = buildString {
